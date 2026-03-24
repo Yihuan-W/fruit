@@ -1,104 +1,130 @@
-"""
-Open Demo: 多尺度数据管线（不读CSV，不落盘）
-- 用可控的“合成信号”替代真实CSV，演示：滑窗切片、归一化、STFT特征。
-- 仅打印数据形状和流程说明，不保存 .npz 文件。
-"""
-
+import os
 import numpy as np
+import pandas as pd
 from scipy.signal import stft
+from sklearn.model_selection import train_test_split
 
-# ============== 可配置参数（仅用于演示） ==============
+# ==================== 参数配置 ====================
+SRC_DIR = "./fruit"     # 原始 CSV 文件路径
+OUT_DIR = "./dataset"      # 输出路径
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# 类别名称（文件名中必须包含这些词）
 CLASSES = ["哈密瓜","松果","枣","柠檬","树莓","核桃","牛油果","玉米","草莓","荔枝"]
-WINDOW_SET = [6, 8, 12, 16]   # 多种窗口时长（秒）
-STEP_SEC   = 0.5              # 滑动步长（秒）
-F_FIX, T_FIX = 50, 50         # 统一后的谱图大小
-SEED = 42
 
-# ============== 合成信号：模拟不同类别的“振动特征” ==============
-def _make_sine_mixture(duration_s: float, fs: float, base_freq: float, drift: float, noise: float):
-    """
-    生成：若干余弦 + 缓慢频率漂移 + 高斯噪声
-    """
-    t = np.arange(0, duration_s, 1.0/fs, dtype=np.float32)
-    f1 = base_freq * (1.0 + 0.05*np.sin(2*np.pi*drift*t))
-    f2 = 1.7*base_freq
-    sig = (np.cos(2*np.pi*f1*t) + 0.6*np.cos(2*np.pi*f2*t + 0.3)) * (0.5+0.5*np.cos(2*np.pi*0.1*t))
-    sig += noise*np.random.randn(len(t)).astype(np.float32)
-    return t, sig
+# 四种滑窗长度（秒）
+WINDOW_SET = [6, 8, 12, 16]
+STEP_SEC = 0.5             # 滑动步长（秒）可改为0.5
+SPEC_NPERSEG = 128
+SPEC_NOVERLAP = 64
 
-def _normalize(x):
-    return (x - x.mean()) / (x.std() + 1e-6)
+# ==================== 工具函数 ====================
+def read_csv_auto(path):
+    """自动读取CSV，仅保留前两列：时间和信号"""
+    for enc in ["utf-8", "gbk", "gb2312"]:
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            break
+        except Exception:
+            continue
+    df = df.dropna(axis=0)
+    # --- 自动检测列数并取前两列 ---
+    if df.shape[1] >= 2:
+        df = df.iloc[:, :2]
+    else:
+        raise ValueError(f"❌ 文件 {path} 列数不足2，无法提取时间和信号")
+    df.columns = ["时间", "信号"]
+    df["时间"] = pd.to_numeric(df["时间"], errors="coerce")
+    df["信号"] = pd.to_numeric(df["信号"], errors="coerce")
+    df = df.dropna()
+    return df
 
-def _extract_segments(sig, fs, window_sec, step_sec):
-    win_len  = int(window_sec * fs)
+
+def compute_sampling_rate(t):
+    """由时间列计算采样率"""
+    dt = np.median(np.diff(t))
+    fs = 1.0 / dt
+    return fs
+
+def normalize_signal(x):
+    """零均值单位方差归一化"""
+    return (x - np.mean(x)) / (np.std(x) + 1e-6)
+
+def extract_segments(sig, fs, window_sec, step_sec):
+    """滑动窗口切片"""
+    win_len = int(window_sec * fs)
     step_len = int(step_sec * fs)
     segs = []
-    for s in range(0, max(0, len(sig)-win_len), step_len):
-        segs.append(sig[s:s+win_len])
-    return np.array(segs, dtype=np.float32)
+    for start in range(0, len(sig) - win_len, step_len):
+        segs.append(sig[start:start + win_len])
+    return np.array(segs)
 
-def _stft_pad(sig, fs, f_fix=F_FIX, t_fix=T_FIX):
-    # 自适应窗口
+
+def compute_stft_features(sig, fs):
+    """计算STFT幅度谱（弱信号增强）"""
     L = len(sig)
-    nperseg = max(16, min(128, L//4))
-    noverlap = nperseg//2
-    f, tt, Z = stft(sig, fs=fs, nperseg=nperseg, noverlap=noverlap)
-    S = np.log1p(np.abs(Z)).astype(np.float32)
+    nperseg = min(128, L // 2)  # 自适应窗口
+    noverlap = nperseg // 2
+
+    f, t, Zxx = stft(sig, fs=fs, nperseg=nperseg, noverlap=noverlap)
+    S = np.abs(Zxx)
+    S = np.log1p(S)  # 对数幅值压缩
+
+    # 统一尺寸
     F, T = S.shape
-    out = np.zeros((f_fix, t_fix), dtype=np.float32)
-    out[:min(F,f_fix), :min(T,t_fix)] = S[:min(F,f_fix), :min(T,t_fix)]
-    return out
+    F_fix, T_fix = 50, 50
+    S_pad = np.zeros((F_fix, T_fix))
+    S_pad[:min(F, F_fix), :min(T, T_fix)] = S[:min(F, F_fix), :min(T, T_fix)]
+    return S_pad
 
-def get_open_demo_dataset(window_sec=12, total_duration=120.0, fs=12.5,
-                          samples_per_class=80, rng=np.random.RandomState(SEED)):
-    """
-    生成“演示集”：只返回内存中的 (X_time, X_spec, Y)，不落盘。
-    - 每个类别先生成一条长序列（可选不同 pattern），再用滑窗切片成样本。
-    """
-    all_xt, all_xs, all_y = [], [], []
 
-    # 为每个类别定义不同的基础频率/漂移/噪声，体现“类差异”
-    base_bank = np.linspace(0.2, 2.0, num=len(CLASSES))   # Hz
-    for label, cls in enumerate(CLASSES):
-        base = base_bank[label]
-        drift = 0.03 + 0.02*(label % 3 + 1)
-        noise = 0.15 + 0.03*(label % 4)
-
-        # 生成一条较长时间的“原始记录”
-        t, raw = _make_sine_mixture(duration_s=total_duration, fs=fs,
-                                    base_freq=base, drift=drift, noise=noise)
-        raw = _normalize(raw)
-
-        # 滑窗切片
-        segs = _extract_segments(raw, fs, window_sec=window_sec, step_sec=STEP_SEC)
-        if len(segs) == 0:
-            continue
-
-        # 随机抽样固定数量的样本（演示）
-        idx = rng.choice(len(segs), size=min(samples_per_class, len(segs)), replace=False)
-        segs = segs[idx]
-
-        # 计算时域/频域特征
-        for seg in segs:
-            xt = seg[np.newaxis, :]                       # (1, L)
-            xs = _stft_pad(seg, fs)[np.newaxis, :, :]     # (1, F, T)
-            all_xt.append(xt); all_xs.append(xs); all_y.append(label)
-
-    X_time = np.array(all_xt, dtype=np.float32)
-    X_spec = np.array(all_xs, dtype=np.float32)
-    Y      = np.array(all_y,  dtype=np.int64)
-
-    # 全局归一化（演示）
-    X_time = (X_time - X_time.mean()) / (X_time.std() + 1e-6)
-    X_spec = (X_spec - X_spec.mean()) / (X_spec.std() + 1e-6)
-
-    return X_time, X_spec, Y
-
+# ==================== 主函数 ====================
 if __name__ == "__main__":
-    np.random.seed(SEED)
-    print("🔧 以 12s 窗口演示多模态数据管线（合成信号）……")
-    X_t, X_s, Y = get_open_demo_dataset(window_sec=12, total_duration=180.0, fs=12.5, samples_per_class=100)
-    print(f"✅ 样本数: {len(Y)}")
-    print(f"✅ 时域形状: {X_t.shape}  (N, 1, L)")
-    print(f"✅ 频域形状: {X_s.shape}  (N, 1, {F_FIX}, {T_FIX})")
-    print("📌 说明：此脚本仅展示数据处理流程，不保存任何文件。")
+    for W in WINDOW_SET:
+        all_Xt, all_Xs, all_Y = [], [], []
+        print(f"\n==================== 🧩 窗口 {W}s ====================")
+
+        for label, cls in enumerate(CLASSES):
+            files = [f for f in os.listdir(SRC_DIR) if cls in f and f.endswith(".csv")]
+            if not files:
+                print(f"⚠️ 未找到类别 {cls} 文件")
+                continue
+
+            for f in files:
+                path = os.path.join(SRC_DIR, f)
+                df = read_csv_auto(path)
+                t = df["时间"].values
+                x = df["信号"].values
+                fs = compute_sampling_rate(t)
+                sig = normalize_signal(x)
+
+                print(f"✅ 读取 {cls}: {len(sig)} 点 ≈ {len(sig)/fs:.1f}s, 采样率≈{fs:.2f} Hz")
+
+                segments = extract_segments(sig, fs, W, STEP_SEC)
+                for seg in segments:
+                    xt = seg[np.newaxis, :]             # (1, L)
+                    xs = compute_stft_features(seg, fs)[np.newaxis, :, :]  # (1, F, T)
+                    all_Xt.append(xt)
+                    all_Xs.append(xs)
+                    all_Y.append(label)
+
+        X_time = np.array(all_Xt)
+        X_spec = np.array(all_Xs)
+        Y = np.array(all_Y)
+        print(f"✅ 总样本: {len(Y)}, 时域形状: {X_time.shape}, 频谱形状: {X_spec.shape}")
+
+        # ===== 全局归一化 =====
+        X_time = (X_time - X_time.mean()) / (X_time.std() + 1e-6)
+        X_spec = (X_spec - X_spec.mean()) / (X_spec.std() + 1e-6)
+
+        # ===== 分层划分训练/验证 =====
+        Xtr_t, Xv_t, Xtr_s, Xv_s, Ytr, Yv = train_test_split(
+            X_time, X_spec, Y, test_size=0.1, stratify=Y, random_state=42
+        )
+
+        np.savez(os.path.join(OUT_DIR, f"dataset_train_{W}s.npz"),
+                 X_time=Xtr_t, X_spec=Xtr_s, Y=Ytr)
+        np.savez(os.path.join(OUT_DIR, f"dataset_val_{W}s.npz"),
+                 X_time=Xv_t, X_spec=Xv_s, Y=Yv)
+
+        print(f"💾 已保存: dataset_train_{W}s.npz / dataset_val_{W}s.npz")
